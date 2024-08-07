@@ -9,6 +9,12 @@
     {% if error %}
     <div class="error-message">{{ error }}</div>
     {% endif %}
+    {% if done %}
+    <div class="done-message">{{ done }}</div>
+    {% endif %}
+    {% if error_verify %}
+    <div class="error-message">{{ error_verify }}, <a href="/manual_mail_verification">Verify</a></div>
+    {% endif %}
     <h1 class="centered animate__animated animate__pulse" style="color: white;">Login</h1>
     <div class="navbar">
         <a href="/">Back</a>
@@ -31,6 +37,14 @@
             </a>
         </form>
         <br>
+        <a class="sign-up-label" href="/register_doc", method="get">
+            Don't have an account?<span class="sign-up-link">Sign up</span>
+        </a><br><br>
+        <p class="page-link">
+            <a href="/forget_password">
+                <span class="page-link-label">Forgot Password?</span>
+            </a>
+          </p>
     </div>  
 </body>
 <script>

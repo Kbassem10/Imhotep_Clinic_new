@@ -1,6 +1,6 @@
-from flask import Flask, redirect, render_template, request, session
+from flask import Flask, redirect, render_template, request, session, flash, url_for
 from flask_session import Session
-from flask_caching import Cache
+from flask_mail import Mail, Message
 from cs50 import SQL
 from werkzeug.utils import secure_filename
 import os
@@ -8,7 +8,7 @@ from werkzeug.security import generate_password_hash, check_password_hash
 import shutil
 from datetime import datetime, timedelta
 import secrets
-import paypalrestsdk
+import logging
 
 app = Flask(__name__)
 
@@ -20,14 +20,20 @@ app.config['SESSION_TYPE'] = 'filesystem'
 sess = Session(app)
 
 #mentien the database
-db = SQL("sqlite:///imhotep_clinic_free.db")
+DATABASE_URL = os.getenv('DATABASE_URL')
+db = SQL(DATABASE_URL)
 
-paypalrestsdk.configure({
-    "mode": "sandbox",  # or "live" for production
-    "client_id": "AdBUJFErpB8bJOSBaKk2XiiGX2A0FmKdSdzZn4k2hc8Qo-SGAsQTvZYp4L8EHpvuo3U7vijpYw0jdJCp",
-    "client_secret": "ENtzJpPGF3Fpw7drd164dolkqeWa9exQAK6WpCiSP1VXfJxR7I4hoY5eT9QksseHQT4ta0n37aJ1PmEg"
-})
+#define the mail to send the verification code and the forget password
+app.config['MAIL_SERVER']='smtp.gmail.com'
+app.config['MAIL_PORT'] = 465
+app.config['MAIL_USERNAME'] = os.getenv('MAIL_USERNAME')
+app.config['MAIL_PASSWORD'] = os.getenv('MAIL_PASSWORD')
+app.config['MAIL_USE_TLS'] = False
+app.config['MAIL_USE_SSL'] = True
+mail = Mail(app)
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 #a function to select all of the data from the patients and details and transactions table where the id is like given from the html
 #and also calculate the age of a person from the date of today - his birthdate
 
@@ -87,6 +93,20 @@ def shape_check():
         else:
             return 0
 
+def send_verification_mail_code(user_mail):
+    verification_code = secrets.token_hex(4)
+    msg = Message('Email Verification', sender='imhoteptech1@gmail.com', recipients=[user_mail])
+    msg.body = f"Your verification code is: {verification_code}"
+    mail.send(msg)
+
+    session["verification_code"] = verification_code
+
+def check_subscriptions(doc_id):
+    now = datetime.utcnow()
+    user = db.execute('SELECT * FROM doctors WHERE doc_id = ?', doc_id)
+    if user['subscription_end_date'] and datetime.strptime(user['subscription_end_date'], '%Y-%m-%d %H:%M:%S.%f') < now:
+        db.execute('UPDATE doctors SET subscription_status = ? WHERE doc_id = ?', 'expired', doc_id)
+
 #the home page route
 @app.route("/")
 def choose():
@@ -98,6 +118,134 @@ def choose():
         return redirect("/assistant_home")
     else:
         return render_template("choose.html")
+
+@app.route("/register_doc", methods=["POST", "GET"])
+def register_doc():
+    if request.method == "GET":
+        return render_template("register_doc.html")
+    elif request.method == "POST": 
+        username = (request.form.get("username").strip()).lower()
+        password = request.form.get("password")
+        category = request.form.get("category")
+        doc_name = request.form.get("doc_name")
+        doc_phone_number = request.form.get("doc_phone_number")
+        user_cat = request.form.get("user_cat")
+        mail = request.form.get("mail")
+
+        if "@gmail.com" not in mail:
+            error_existing = "Please Use a gmail account for better experience"
+            return render_template("register_doc.html", error=error_existing)
+        
+        if "@" in username:
+            error_existing = "The username shouldn't have @ on it"
+            return render_template("register_doc.html", error=error_existing)
+        
+        new_password = generate_password_hash(password)
+        existing_user = db.execute("SELECT * FROM( SELECT username FROM doctors WHERE LOWER(username) = ? UNION ALL SELECT username FROM assistants WHERE LOWER(username) =?) AS combined_table", username, username)
+
+        if existing_user and user_cat == "doctor":#an if condition to see if this username is saved by another user
+            error_existing = "Username is unavailable. Please choose another one."
+            return render_template("register_doc.html", error=error_existing)
+
+        elif existing_user and user_cat == "admin":#an if condition to see if this username is saved by another user
+            error_existing = "Username is unavailable. Please choose another one."
+            return render_template("register_doc.html", error=error_existing)
+
+        existing_mail = db.execute("SELECT mail FROM doctors WHERE mail = ?", mail)
+        if existing_mail:
+            error_existing = "E-mail is used"
+            return render_template("register_doc.html", error=error_existing)
+
+        db.execute("INSERT INTO doctors (username, password, category, doc_name, doc_phone_number, user_cat, mail, shape, mail_verify) VALUES (?, ?, ? ,? , ?, ?, ?, ?, ?)", username, new_password, category, doc_name, doc_phone_number, user_cat, mail, "all", "not_verified")
+        done = "User added"
+        doc_id = db.execute("SELECT doc_id FROM doctors WHERE mail= ? AND  username = ?",mail, username )
+        session["doc_id"] = doc_id[0]["doc_id"]
+        
+        send_verification_mail_code(mail)
+
+        return render_template("verify_mail.html", mail=mail, username=username)
+
+@app.route("/verify_mail", methods=["POST"])
+def verify_mail():
+        if request.method == "GET":
+            return render_template("verify_mail.html")
+        verification_code = request.form.get("verification_code").strip()
+        doc_id = session.get("doc_id")
+        user_mail = request.form.get("mail")
+        if verification_code == session.get("verification_code"):
+            db.execute("UPDATE doctors SET mail_verify = ? WHERE doc_id = ?","verified" ,doc_id )
+            try:
+                msg = Message('Email Changed', sender='imhotepfinance@gmail.com', recipients=[user_mail])
+                msg.body = f"Welcome To Imhotep Finacial Manager"
+                mail.send(msg)
+                return redirect("/sub")
+            except:
+                return redirect("/sub")
+        
+        else:
+            error="Invalid verification code."
+            return render_template("mail_verify.html", error=error)
+
+@app.route("/sub", methods=["GET", "POST"])
+def sub():
+    return render_template("sub.html")
+
+@app.route('/subscription-success')
+def subscription_success():
+    subscription_id = request.args.get('subscriptionID')
+    doc_id = session.get("doc_id")
+    if doc_id:
+        db.execute("UPDATE doctors SET subscription_status = ?, subscription_start_date = ?, subscription_end_date = ? WHERE doc_id = ?",'active', datetime.utcnow(), datetime.utcnow() + timedelta(days=30), doc_id)
+        flash('Subscription completed successfully!')
+        return redirect(url_for('home'))
+    else:
+        flash('Error: No doctor ID found in session.')
+        return redirect(url_for('sub'))
+
+@app.route("/manual_mail_verification", methods=["POST", "GET"])
+def manual_mail_verification():
+    if request.method == "GET":
+        return render_template("manual_mail_verification.html")
+    else: 
+        mail = (request.form.get("mail").strip()).lower()
+        mail_verify_db = db.execute("SELECT doc_id, mail_verify FROM doctors WHERE mail = ?", mail)
+        if mail_verify_db:
+            doc_id = mail_verify_db[0]["doc_id"]
+            mail_verify = mail_verify_db[0]["mail_verify"]
+        else:
+            error_not = "This mail isn't used on the webapp!"
+            return render_template("manual_mail_verification.html", error_not = error_not)
+        
+        if mail_verify == "verified":
+            error = "This Mail is already used and verified"
+            return render_template("login.html", error=error)
+        else:
+            session["doc_id"] = doc_id
+            send_verification_mail_code(mail)
+            return render_template("verify_mail.html")
+
+@app.route("/forget_password",methods=["POST", "GET"])
+def forget_password():
+    if request.method == "GET":
+        return render_template("forget_password.html")
+    else:
+        user_mail = request.form.get("mail")
+        mail_db = db.execute("SELECT mail FROM doctors WHERE mail = ?", user_mail)
+        if mail_db:
+
+            temp_password = secrets.token_hex(4)
+            msg = Message('Reset Password', sender='imhoteptech1@gmail.com', recipients=[user_mail])
+            msg.body = f"Your temporary Password is: {temp_password}"
+            mail.send(msg)
+            
+            hashed_password = generate_password_hash(temp_password)
+            db.execute("UPDATE doctors SET password = ? WHERE mail = ?",hashed_password, user_mail)
+
+            done="The Mail is sent check Your mail for your new password"
+            return render_template("login.html", done=done)
+        else:
+            error = "This Email isn't saved"
+            return render_template("forget_password.html", error = error, secret_key=secret_key)
 
 #the login route that checks if the username "not case sensitive" and the password the are given from the template are the same as those on the databse
 #and also check if the user category of this person is doctor so it shows for him the doctors page and if he is an admin it shows to him the admin page
@@ -114,6 +262,7 @@ def sign_in_admin():
         if len(login) > 0:
             user_cat = login[0]["user_cat"]
             password_db = login[0]["password"]
+            mail_verify = login[0]["mail_verify"]
 
         if len(login_a) > 0:
             user_cat_a = login_a[0]["user_cat"]
@@ -121,22 +270,26 @@ def sign_in_admin():
 
         #checks if the data are in the database make the session logged_in = true if not it shows an error
         if login and check_password_hash(password_db, password):
-            if user_cat == "doctor":
-                    doctor = db.execute("SELECT doc_id FROM doctors WHERE LOWER(username) = ? AND password = ?", username, password_db)
-                    session.pop("logged_in_assistant", None)
-                    session.pop("a_id", None)
-                    session["logged_in"] = True
-                    session["doc_id"] = doctor[0]["doc_id"]
-                    session.permanent = True
-                    return redirect("/home")
-            elif user_cat == "admin":
-                    doctor = db.execute("SELECT doc_id FROM doctors WHERE LOWER(username) = ? AND password = ?", username, password_db)
-                    session.pop("logged_in_assistant", None)
-                    session.pop("a_id", None)
-                    session["logged_in_admin"] = True
-                    session["doc_id"] = doctor[0]["doc_id"]
-                    session.permanent = True
-                    return redirect("/admin_home")
+                if user_cat == "doctor":
+                        if mail_verify == "verified":
+                            doctor = db.execute("SELECT doc_id FROM doctors WHERE LOWER(username) = ? AND password = ?", username, password_db)
+                            session.pop("logged_in_assistant", None)
+                            session.pop("a_id", None)
+                            session["logged_in"] = True
+                            session["doc_id"] = doctor[0]["doc_id"]
+                            session.permanent = True
+                            return redirect("/home")
+                        else:
+                            error_verify = "This username has a not verified email"
+                            return render_template("login.html", error_verify=error_verify)
+                elif user_cat == "admin":
+                        doctor = db.execute("SELECT doc_id FROM doctors WHERE LOWER(username) = ? AND password = ?", username, password_db)
+                        session.pop("logged_in_assistant", None)
+                        session.pop("a_id", None)
+                        session["logged_in_admin"] = True
+                        session["doc_id"] = doctor[0]["doc_id"]
+                        session.permanent = True
+                        return redirect("/admin_home")
         elif login_a and check_password_hash(login_a[0]["password"], password):
             if user_cat_a == "assistant":
                 doctor = db.execute("SELECT a_id FROM assistants WHERE LOWER(username) = ? AND password = ?", username, password_db_a)
@@ -214,9 +367,15 @@ def home_page():
     if not session.get("logged_in"):
         return redirect("/login")
     else:
+        doc_id = session.get("doc_id")
+        check_subscriptions(doc_id)
+        user = db.execute('SELECT * FROM doctors WHERE doc_id = ?', doc_id)
+        if user['subscription_status'] != 'active':
+            flash('Your subscription has expired. Please renew to continue.')
+            return redirect(url_for('sub'))
+        
         current_date = datetime.now().strftime('%Y-%m-%d')
         date = datetime.now().date()
-        doc_id = session.get("doc_id")
 
         # Use SQL JOIN to fetch appointments with patient names
         appoint = db.execute("""
@@ -1808,3 +1967,4 @@ def update_assi():
         else:
             db.execute("UPDATE assistants SET username = ?, a_name = ?, a_phonenumber = ? WHERE a_id = ?", username,a_name, a_phonenumber, a_id)
             return redirect("/assistant_home")
+        
